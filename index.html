@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>准刻(AccuDoc)</title>
+    <!-- 引入核心库 -->
+    <script src="pizzip.min.js"></script>
+    <script src="docxtemplater.js"></script>
+    <script src="FileSaver.min.js"></script>
+
+    <style>
+        /* 布局修复：强制所有元素使用 border-box 模型 */
+        *, *::before, *::after { box-sizing: border-box; }
+
+        :root { --primary: #27ae60; --highlight: #e67e22; --bg: #f3f4f6; }
+        
+        body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; background: var(--bg); margin: 0; padding: 20px; color: #333; }
+        .container { max-width: 1400px; margin: 0 auto; background: #fff; padding: 25px; border-radius: 15px; box-shadow: 0 8px 30px rgba(0,0,0,0.1); }
+        
+        .step { display: none; }
+        .active { display: block; }
+        
+        /* 表格样式 */
+        .word-table { border-collapse: collapse; width: 100%; font-size: 12px; table-layout: fixed; border: 2px solid #333; background: #fff; }
+        .word-table td { border: 1px solid #666; padding: 8px; position: relative; word-break: break-all; min-height: 35px; vertical-align: middle; }
+        
+        /* 标记阶段样式 */
+        .setup-td { cursor: pointer; transition: 0.2s; }
+        .setup-td:hover { background: #f0fdf4; outline: 2px solid var(--primary); z-index: 5; }
+        .selected-cell { background: #dcfce7 !important; outline: 2px solid var(--primary) !important; }
+        .var-badge { background: var(--primary); color: white; font-size: 10px; padding: 2px 5px; border-radius: 4px; position: absolute; top: 0; right: 0; }
+
+        /* 填表阶段布局 */
+        .sync-view { display: flex; gap: 20px; margin-top: 15px; height: 75vh; }
+        .form-panel { flex: 1; overflow-y: auto; padding-right: 15px; border-right: 1px solid #eee; }
+        .preview-panel { flex: 1.6; overflow-y: auto; padding: 20px; background: #fff; border: 1px solid #ddd; }
+
+        /* 输入框样式 */
+        .input-card { background: #fff; border: 1px solid #eee; padding: 15px; border-radius: 8px; margin-bottom: 12px; border-left: 6px solid #e5e7eb; }
+        .input-card.focused { border-left-color: var(--highlight); background: #fffbeb; }
+        .input-card label { display: block; font-weight: bold; margin-bottom: 5px; font-size: 14px; }
+        .orig-hint { font-size: 11px; color: #999; margin-bottom: 5px; }
+
+        input { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; outline: none; display: block; }
+        input:focus { border-color: var(--highlight); }
+
+        /* 高亮预览 */
+        .live-cell { outline: 3px solid var(--highlight) !important; background: #fff9c4 !important; z-index: 20; transform: scale(1.01); }
+        .filled-txt { color: var(--primary); font-weight: bold; }
+
+        .footer { margin-top: 20px; display: flex; justify-content: center; gap: 15px; border-top: 1px solid #eee; padding-top: 15px; }
+        button { padding: 12px 40px; border-radius: 8px; font-weight: bold; cursor: pointer; border: none; transition: 0.2s; }
+        .btn-green { background: var(--primary); color: white; }
+        .btn-gray { background: #94a3b8; color: white; }
+
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div id="step1" class="step active">
+        <h2 style="text-align:center; color: var(--primary);">1. 上传 Word 表格</h2>
+        <div style="text-align:center; padding:50px; border:3px dashed #cbd5e1; border-radius:15px; background: #fafafa;">
+            <input type="file" id="fileInput" accept=".docx">
+        </div>
+    </div>
+
+    <div id="step2" class="step">
+        <h2>2. 标记需要填写的格子</h2>
+        <div id="setupTableContainer" style="overflow-x:auto;"></div>
+        <div class="footer">
+            <button class="btn-green" onclick="toStep3()">确认并进入填表预览</button>
+            <button class="btn-gray" onclick="location.reload()">重新上传</button>
+        </div>
+    </div>
+
+    <div id="step3" class="step">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <h2 style="color: var(--highlight)">3. 实时填表 (字号/字体 1:1 保留)</h2>
+        </div>
+        <div class="sync-view">
+            <div id="formPanel" class="form-panel"></div>
+            <div id="previewPanel" class="preview-panel">
+                <div id="syncPreviewArea"></div>
+            </div>
+        </div>
+        <div class="footer">
+            <button class="btn-green" onclick="generateFinal()" style="padding: 15px 60px; font-size: 18px;">导出 Word (绝对格式同步)</button>
+            <button class="btn-gray" onclick="showStep(2)">返回修改</button>
+        </div>
+    </div>
+</div>
+
+<script>
+    let zip=null, mainXml=null, fieldVars=[];
+
+    document.getElementById('fileInput').onchange = function(e) {
+        const file = e.target.files[0];
+        const reader = new FileReader();
+        reader.onload = function(ev) {
+            zip = new PizZip(ev.target.result);
+            mainXml = new DOMParser().parseFromString(zip.file("word/document.xml").asText(), "text/xml");
+            renderTable("setupTableContainer", true);
+            showStep(2);
+        };
+        reader.readAsArrayBuffer(file);
+    };
+
+    function renderTable(containerId, setup) {
+        const container = document.getElementById(containerId); container.innerHTML = '';
+        const tables = mainXml.getElementsByTagName("w:tbl");
+        Array.from(tables).forEach((table, tIdx) => {
+            const htmlTable = document.createElement('table'); htmlTable.className = 'word-table';
+            Array.from(table.getElementsByTagName("w:tr")).forEach((row, rIdx) => {
+                const tr = document.createElement('tr');
+                const cells = row.getElementsByTagName("w:tc");
+                Array.from(cells).forEach((cell, cIdx) => {
+                    const td = document.createElement('td');
+                    let txt = ""; Array.from(cell.getElementsByTagName("w:t")).forEach(t => txt += t.textContent);
+                    const path = `${tIdx}_${rIdx}_${cIdx}`;
+                    td.id = (setup ? "set_" : "pre_") + path; td.innerText = txt || "";
+                    if (setup) {
+                        td.className = "setup-td";
+                        td.onclick = () => {
+                            const idx = fieldVars.findIndex(v => v.path === path);
+                            if (idx > -1) { fieldVars.splice(idx,1); td.classList.remove('selected-cell'); td.innerHTML=txt; }
+                            else {
+                                let hint = "";
+                                if (cIdx > 0) {
+                                    Array.from(cells[cIdx-1].getElementsByTagName("w:t")).forEach(t => hint += t.textContent);
+                                    hint = hint.trim().replace(/[:：]/g, '');
+                                }
+                                const label = prompt("此项的名称：", hint || "未命名");
+                                if(label) {
+                                    fieldVars.push({tIdx, rIdx, cIdx, path, varName:"v_"+path, label, defaultValue:txt});
+                                    td.classList.add('selected-cell'); td.innerHTML=`${txt}<span class="var-badge">${label}</span>`;
+                                }
+                            }
+                        };
+                    }
+                    tr.appendChild(td);
+                });
+                htmlTable.appendChild(tr);
+            });
+            container.appendChild(htmlTable);
+        });
+    }
+
+    function toStep3() {
+        if(fieldVars.length===0) return;
+        renderTable("syncPreviewArea", false);
+        const panel = document.getElementById('formPanel'); panel.innerHTML = '';
+        fieldVars.forEach(v => {
+            const div = document.createElement('div'); div.className='input-card'; div.id="card_"+v.path;
+            div.innerHTML = `<label>${v.label}</label><input type="text" id="in_${v.varName}" oninput="sync('${v.path}',this.value)" onfocus="high('${v.path}',true)" onblur="high('${v.path}',false)">`;
+            panel.appendChild(div);
+            document.getElementById("in_"+v.varName).value = v.defaultValue;
+            sync(v.path, v.defaultValue);
+        });
+        showStep(3);
+    }
+
+    function sync(path, val) { 
+        const td = document.getElementById("pre_"+path); 
+        if(td) { td.innerText = val || ""; td.className = (val !== "") ? "filled-txt" : ""; }
+    }
+    function high(path, f) { 
+        const td = document.getElementById("pre_"+path); const card = document.getElementById("card_"+path);
+        if(td) { f?td.classList.add('live-cell'):td.classList.remove('live-cell'); if(f) td.scrollIntoView({behavior:'smooth',block:'center'}); }
+        if(card) f?card.classList.add('focused'):card.classList.remove('focused');
+    }
+
+    // --- 核心修复：1:1 克隆所有格式属性 ---
+    function generateFinal() {
+        try {
+            const workingXml = mainXml.cloneNode(true);
+            const tables = workingXml.getElementsByTagName("w:tbl");
+
+            fieldVars.forEach(v => {
+                const cell = tables[v.tIdx].getElementsByTagName("w:tr")[v.rIdx].getElementsByTagName("w:tc")[v.cIdx];
+                
+                // 1. 寻找该单元格内原本的样式属性节点 (w:rPr)
+                const originalRPr = cell.getElementsByTagName("w:rPr")[0];
+                let clonedRPr = null;
+                if (originalRPr) {
+                    clonedRPr = originalRPr.cloneNode(true); // 克隆字号、字体、加粗等
+                }
+
+                // 2. 寻找原段落属性 (w:pPr)，用于保留对齐方式
+                const p = cell.getElementsByTagName("w:p")[0] || workingXml.createElement("w:p");
+                const originalPPr = p.getElementsByTagName("w:pPr")[0];
+                let clonedPPr = null;
+                if (originalPPr) {
+                    clonedPPr = originalPPr.cloneNode(true); // 克隆水平对齐方式
+                }
+
+                // 3. 清空该段落内容并重建
+                p.innerHTML = ""; 
+                
+                // 还原段落属性（对齐等）
+                if (clonedPPr) p.appendChild(clonedPPr);
+
+                // 创建新的内容轨道
+                const r = workingXml.createElement("w:r");
+                // 注入克隆的样式属性（字号字体等）
+                if (clonedRPr) r.appendChild(clonedRPr);
+                
+                const t = workingXml.createElement("w:t");
+                t.textContent = "{" + v.varName + "}";
+                
+                r.appendChild(t);
+                p.appendChild(r);
+            });
+
+            zip.file("word/document.xml", new XMLSerializer().serializeToString(workingXml));
+            const doc = new window.docxtemplater(zip, { paragraphLoop: true, linebreaks: true });
+            const data = {}; fieldVars.forEach(v => {
+                data[v.varName] = document.getElementById("in_"+v.varName).value || " ";
+            });
+            doc.render(data);
+            saveAs(doc.getZip().generate({type:"blob"}), `格式1比1导出_${Date.now()}.docx`);
+        } catch (e) { console.error(e); alert("导出失败"); }
+    }
+
+    function showStep(n) { document.querySelectorAll('.step').forEach(s => s.classList.remove('active')); document.getElementById('step' + n).classList.add('active'); }
+</script>
+</body>
+</html>
